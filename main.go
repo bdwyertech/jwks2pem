@@ -18,8 +18,7 @@ func main() {
 	url := os.Args[1]
 	set, err := jwk.Fetch(context.Background(), url)
 	if err != nil {
-		log.Printf("failed to parse JWK: %s", err)
-		return
+		log.Fatalf("failed to parse JWK: %s", err)
 	}
 
 	var kid *string
