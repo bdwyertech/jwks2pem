@@ -2,13 +2,12 @@ package jwk
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/ed25519"
 	"fmt"
 
+	"github.com/lestrrat-go/blackmagic"
 	"github.com/lestrrat-go/jwx/internal/base64"
-	"github.com/lestrrat-go/jwx/internal/blackmagic"
 	"github.com/lestrrat-go/jwx/jwa"
 	"github.com/lestrrat-go/jwx/x25519"
 	"github.com/pkg/errors"
@@ -43,12 +42,12 @@ func (k *okpPrivateKey) FromRaw(rawKeyIf interface{}) error {
 	switch rawKey := rawKeyIf.(type) {
 	case ed25519.PrivateKey:
 		k.d = rawKey.Seed()
-		k.x = rawKey.Public().(ed25519.PublicKey)
+		k.x = rawKey.Public().(ed25519.PublicKey) //nolint:forcetypeassert
 		crv = jwa.Ed25519
 		k.crv = &crv
 	case x25519.PrivateKey:
 		k.d = rawKey.Seed()
-		k.x = rawKey.Public().(x25519.PublicKey)
+		k.x = rawKey.Public().(x25519.PublicKey) //nolint:forcetypeassert
 		crv = jwa.X25519
 		k.crv = &crv
 	default:
@@ -117,13 +116,12 @@ func (k *okpPrivateKey) Raw(v interface{}) error {
 }
 
 func makeOKPPublicKey(v interface {
-	Iterate(context.Context) HeaderIterator
+	makePairs() []*HeaderPair
 }) (Key, error) {
 	newKey := NewOKPPublicKey()
 
 	// Iterate and copy everything except for the bits that should not be in the public key
-	for iter := v.Iterate(context.TODO()); iter.Next(context.TODO()); {
-		pair := iter.Pair()
+	for _, pair := range v.makePairs() {
 		switch pair.Key {
 		case OKPDKey:
 			continue

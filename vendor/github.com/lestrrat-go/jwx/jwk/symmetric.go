@@ -1,12 +1,11 @@
 package jwk
 
 import (
-	"context"
 	"crypto"
 	"fmt"
 
+	"github.com/lestrrat-go/blackmagic"
 	"github.com/lestrrat-go/jwx/internal/base64"
-	"github.com/lestrrat-go/jwx/internal/blackmagic"
 	"github.com/pkg/errors"
 )
 
@@ -51,8 +50,7 @@ func (k *symmetricKey) Thumbprint(hash crypto.Hash) ([]byte, error) {
 func (k *symmetricKey) PublicKey() (Key, error) {
 	newKey := NewSymmetricKey()
 
-	for iter := k.Iterate(context.TODO()); iter.Next(context.TODO()); {
-		pair := iter.Pair()
+	for _, pair := range k.makePairs() {
 		if err := newKey.Set(pair.Key.(string), pair.Value); err != nil {
 			return nil, errors.Wrapf(err, `failed to set field %s`, pair.Key)
 		}

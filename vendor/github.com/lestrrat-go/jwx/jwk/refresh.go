@@ -26,9 +26,12 @@ import (
 // All JWKS objects that are retrieved via the auto-fetch mechanism should be
 // treated read-only, as they are shared among the consumers and this object.
 type AutoRefresh struct {
+	errSink      chan AutoRefreshError
 	cache        map[string]Set
 	configureCh  chan struct{}
+	removeCh     chan removeReq
 	fetching     map[string]chan struct{}
+	muErrSink    sync.Mutex
 	muCache      sync.RWMutex
 	muFetching   sync.Mutex
 	muRegistry   sync.RWMutex
@@ -83,6 +86,8 @@ type target struct {
 	// for debugging, snapshoting
 	lastRefresh time.Time
 	nextRefresh time.Time
+
+	wl Whitelist
 }
 
 type resetTimerReq struct {
@@ -110,6 +115,7 @@ func NewAutoRefresh(ctx context.Context) *AutoRefresh {
 	af := &AutoRefresh{
 		cache:        make(map[string]Set),
 		configureCh:  make(chan struct{}),
+		removeCh:     make(chan removeReq),
 		fetching:     make(map[string]chan struct{}),
 		registry:     make(map[string]*target),
 		resetTimerCh: make(chan *resetTimerReq),
@@ -126,6 +132,19 @@ func (af *AutoRefresh) getCached(url string) (Set, bool) {
 		return ks, true
 	}
 	return nil, false
+}
+
+type removeReq struct {
+	replyCh chan error
+	url     string
+}
+
+// Remove removes `url` from the list of urls being watched by jwk.AutoRefresh.
+// If the url is not already registered, returns an error.
+func (af *AutoRefresh) Remove(url string) error {
+	ch := make(chan error)
+	af.removeCh <- removeReq{replyCh: ch, url: url}
+	return <-ch
 }
 
 // Configure registers the url to be controlled by AutoRefresh, and also
@@ -148,9 +167,11 @@ func (af *AutoRefresh) Configure(url string, options ...AutoRefreshOption) {
 	var httpcl HTTPClient = http.DefaultClient
 	var hasRefreshInterval bool
 	var refreshInterval time.Duration
+	var wl Whitelist
 	minRefreshInterval := time.Hour
 	bo := backoff.Null()
 	for _, option := range options {
+		//nolint:forcetypeassert
 		switch option.Ident() {
 		case identFetchBackoff{}:
 			bo = option.Value().(backoff.Policy)
@@ -161,6 +182,8 @@ func (af *AutoRefresh) Configure(url string, options ...AutoRefreshOption) {
 			minRefreshInterval = option.Value().(time.Duration)
 		case identHTTPClient{}:
 			httpcl = option.Value().(HTTPClient)
+		case identFetchWhitelist{}:
+			wl = option.Value().(Whitelist)
 		}
 	}
 
@@ -192,6 +215,11 @@ func (af *AutoRefresh) Configure(url string, options ...AutoRefreshOption) {
 				doReconfigure = true
 			}
 		}
+
+		if t.wl != wl {
+			t.wl = wl
+			doReconfigure = true
+		}
 	} else {
 		t = &target{
 			backoff:            bo,
@@ -203,6 +231,7 @@ func (af *AutoRefresh) Configure(url string, options ...AutoRefreshOption) {
 			// Make it sufficiently in the future so that we don't have bogus
 			// events firing
 			timer: time.NewTimer(24 * time.Hour),
+			wl:    wl,
 		}
 		if hasRefreshInterval {
 			t.refreshInterval = &refreshInterval
@@ -235,6 +264,13 @@ func (af *AutoRefresh) releaseFetching(url string) {
 	af.muFetching.Unlock()
 }
 
+// IsRegistered checks if `url` is registered already.
+func (af *AutoRefresh) IsRegistered(url string) bool {
+	_, ok := af.getRegistered(url)
+	return ok
+}
+
+// Fetch returns a jwk.Set from the given url.
 func (af *AutoRefresh) getRegistered(url string) (*target, bool) {
 	af.muRegistry.RLock()
 	t, ok := af.registry[url]
@@ -325,21 +361,32 @@ func (af *AutoRefresh) refreshLoop(ctx context.Context) {
 	// in a very fast iteration, but we assume here that refreshes happen
 	// seldom enough that being able to call one `select{}` with multiple
 	// targets / channels outweighs the speed penalty of using reflect.
-	baseSelcases := []reflect.SelectCase{
-		{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(ctx.Done()),
-		},
-		{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(af.configureCh),
-		},
-		{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(af.resetTimerCh),
-		},
+	//
+	const (
+		ctxDoneIdx = iota
+		configureIdx
+		resetTimerIdx
+		removeIdx
+		baseSelcasesLen
+	)
+
+	baseSelcases := make([]reflect.SelectCase, baseSelcasesLen)
+	baseSelcases[ctxDoneIdx] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(ctx.Done()),
 	}
-	baseidx := len(baseSelcases)
+	baseSelcases[configureIdx] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(af.configureCh),
+	}
+	baseSelcases[resetTimerIdx] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(af.resetTimerCh),
+	}
+	baseSelcases[removeIdx] = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(af.removeCh),
+	}
 
 	var targets []*target
 	var selcases []reflect.SelectCase
@@ -355,7 +402,7 @@ func (af *AutoRefresh) refreshLoop(ctx context.Context) {
 		}
 
 		if cap(selcases) < len(af.registry) {
-			selcases = make([]reflect.SelectCase, 0, len(af.registry)+baseidx)
+			selcases = make([]reflect.SelectCase, 0, len(af.registry)+baseSelcasesLen)
 		} else {
 			selcases = selcases[:0]
 		}
@@ -372,22 +419,22 @@ func (af *AutoRefresh) refreshLoop(ctx context.Context) {
 
 		chosen, recv, recvOK := reflect.Select(selcases)
 		switch chosen {
-		case 0:
+		case ctxDoneIdx:
 			// <-ctx.Done(). Just bail out of this loop
 			return
-		case 1:
+		case configureIdx:
 			// <-configureCh. rebuild the select list from the registry.
 			// since we're rebuilding everything for each iteration,
 			// we just need to start the loop all over again
 			continue
-		case 2:
+		case resetTimerIdx:
 			// <-resetTimerCh. interrupt polling, and reset the timer on
 			// a single target. this needs to be handled inside this select
 			if !recvOK {
 				continue
 			}
 
-			req := recv.Interface().(*resetTimerReq)
+			req := recv.Interface().(*resetTimerReq) //nolint:forcetypeassert
 			t := req.t
 			d := req.d
 			if !t.timer.Stop() {
@@ -397,6 +444,20 @@ func (af *AutoRefresh) refreshLoop(ctx context.Context) {
 				}
 			}
 			t.timer.Reset(d)
+		case removeIdx:
+			// <-removeCh. remove the URL from future fetching
+			//nolint:forcetypeassert
+			req := recv.Interface().(removeReq)
+			replyCh := req.replyCh
+			url := req.url
+			af.muRegistry.Lock()
+			if _, ok := af.registry[url]; !ok {
+				replyCh <- errors.Errorf(`invalid url %q (not registered)`, url)
+			} else {
+				delete(af.registry, url)
+				replyCh <- nil
+			}
+			af.muRegistry.Unlock()
 		default:
 			// Do not fire a refresh in case the channel was closed.
 			if !recvOK {
@@ -404,7 +465,7 @@ func (af *AutoRefresh) refreshLoop(ctx context.Context) {
 			}
 
 			// Time to refresh a target
-			t := targets[chosen-baseidx]
+			t := targets[chosen-baseSelcasesLen]
 
 			// Check if there are other goroutines still doing the refresh asynchronously.
 			// This could happen if the refreshing goroutine is stuck on a backoff
@@ -441,33 +502,53 @@ func (af *AutoRefresh) doRefreshRequest(ctx context.Context, url string, enableB
 	if enableBackoff {
 		options = append(options, WithFetchBackoff(t.backoff))
 	}
+	if t.wl != nil {
+		options = append(options, WithFetchWhitelist(t.wl))
+	}
 
 	res, err := fetch(ctx, url, options...)
 	if err == nil {
-		defer res.Body.Close()
-		keyset, parseErr := ParseReader(res.Body)
-		if parseErr == nil {
-			// Got a new key set. replace the keyset in the target
-			af.muCache.Lock()
-			af.cache[url] = keyset
-			af.muCache.Unlock()
-			nextInterval := calculateRefreshDuration(res, t.refreshInterval, t.minRefreshInterval)
-			rtr := &resetTimerReq{
-				t: t,
-				d: nextInterval,
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case af.resetTimerCh <- rtr:
-			}
+		if res.StatusCode != http.StatusOK {
+			// now, can there be a remote resource that responds with a status code
+			// other than 200 and still be valid...? naaaaaaahhhhhh....
+			err = errors.Errorf(`bad response status code (%d)`, res.StatusCode)
+		} else {
+			defer res.Body.Close()
+			keyset, parseErr := ParseReader(res.Body)
+			if parseErr == nil {
+				// Got a new key set. replace the keyset in the target
+				af.muCache.Lock()
+				af.cache[url] = keyset
+				af.muCache.Unlock()
+				nextInterval := calculateRefreshDuration(res, t.refreshInterval, t.minRefreshInterval)
+				rtr := &resetTimerReq{
+					t: t,
+					d: nextInterval,
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case af.resetTimerCh <- rtr:
+				}
 
-			now := time.Now()
-			t.lastRefresh = now.Local()
-			t.nextRefresh = now.Add(nextInterval).Local()
-			return nil
+				now := time.Now()
+				t.lastRefresh = now.Local()
+				t.nextRefresh = now.Add(nextInterval).Local()
+				return nil
+			}
+			err = parseErr
 		}
-		err = parseErr
+	}
+
+	// At this point if err != nil, we know that there was something wrong
+	// in either the fetching or the parsing. Send this error to be processed,
+	// but take the extra mileage to not block regular processing by
+	// discarding the error if we fail to send it through the channel
+	if err != nil {
+		select {
+		case af.errSink <- AutoRefreshError{Error: err, URL: url}:
+		default:
+		}
 	}
 
 	// We either failed to perform the HTTP GET, or we failed to parse the
@@ -478,7 +559,7 @@ func (af *AutoRefresh) doRefreshRequest(ctx context.Context, url string, enableB
 	// If we failed to get a single time, then queue another fetch in the future.
 	rtr := &resetTimerReq{
 		t: t,
-		d: t.minRefreshInterval,
+		d: calculateRefreshDuration(res, t.refreshInterval, t.minRefreshInterval),
 	}
 	select {
 	case <-ctx.Done():
@@ -489,18 +570,46 @@ func (af *AutoRefresh) doRefreshRequest(ctx context.Context, url string, enableB
 	return err
 }
 
+// ErrorSink sets a channel to receive JWK fetch errors, if any.
+// Only the errors that occurred *after* the channel was set  will be sent.
+//
+// The user is responsible for properly draining the channel. If the channel
+// is not drained properly, errors will be discarded.
+//
+// To disable, set a nil channel.
+func (af *AutoRefresh) ErrorSink(ch chan AutoRefreshError) {
+	af.muErrSink.Lock()
+	af.errSink = ch
+	af.muErrSink.Unlock()
+}
+
 func calculateRefreshDuration(res *http.Response, refreshInterval *time.Duration, minRefreshInterval time.Duration) time.Duration {
 	// This always has precedence
 	if refreshInterval != nil {
 		return *refreshInterval
 	}
 
-	if v := res.Header.Get(`Cache-Control`); v != "" {
-		dir, err := httpcc.ParseResponse(v)
-		if err == nil {
-			maxAge, ok := dir.MaxAge()
-			if ok {
-				resDuration := time.Duration(maxAge) * time.Second
+	if res != nil {
+		if v := res.Header.Get(`Cache-Control`); v != "" {
+			dir, err := httpcc.ParseResponse(v)
+			if err == nil {
+				maxAge, ok := dir.MaxAge()
+				if ok {
+					resDuration := time.Duration(maxAge) * time.Second
+					if resDuration > minRefreshInterval {
+						return resDuration
+					}
+					return minRefreshInterval
+				}
+				// fallthrough
+			}
+			// fallthrough
+		}
+
+		if v := res.Header.Get(`Expires`); v != "" {
+			expires, err := http.ParseTime(v)
+			if err == nil {
+				resDuration := time.Until(expires)
 				if resDuration > minRefreshInterval {
 					return resDuration
 				}
@@ -508,19 +617,6 @@ func calculateRefreshDuration(res *http.Response, refreshInterval *time.Duration
 			}
 			// fallthrough
 		}
-		// fallthrough
-	}
-
-	if v := res.Header.Get(`Expires`); v != "" {
-		expires, err := http.ParseTime(v)
-		if err == nil {
-			resDuration := time.Until(expires)
-			if resDuration > minRefreshInterval {
-				return resDuration
-			}
-			return minRefreshInterval
-		}
-		// fallthrough
 	}
 
 	// Previous fallthroughs are a little redandunt, but hey, it's all good.
